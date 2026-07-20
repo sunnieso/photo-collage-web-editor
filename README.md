@@ -15,3 +15,24 @@ replacing a photo with another one
 export the collage as PDF , PNG, or JPEG
 ```
 
+## Running Locally
+
+**Prerequisites:** Node.js 18+ and npm.
+
+```bash
+# Install dependencies
+npm install
+
+# Start the development server
+npm run dev
+```
+
+Open `http://localhost:5173` in your browser.
+
+**Other commands:**
+
+```bash
+npm run build    # Production build (outputs a single self-contained HTML file via vite-plugin-singlefile)
+npm run preview  # Preview the production build locally
+```
+
