@@ -8,6 +8,24 @@ import { heicToJpeg, isHeicFile, needsHeicDecode } from "./utils/heic";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
 
+// Keeps a cell's photo covering the cell at all times — the pan offset can
+// never move the image edge inward of the cell edge, which is what would
+// expose a gap.
+function clampCellOffset(
+  photo: { naturalWidth: number; naturalHeight: number; scale: number },
+  offsetX: number,
+  offsetY: number,
+  cellW: number,
+  cellH: number
+) {
+  const baseScale = Math.max(cellW / photo.naturalWidth, cellH / photo.naturalHeight);
+  const drawW = photo.naturalWidth * baseScale * photo.scale;
+  const drawH = photo.naturalHeight * baseScale * photo.scale;
+  const maxX = Math.max(0, (drawW - cellW) / 2);
+  const maxY = Math.max(0, (drawH - cellH) / 2);
+  return { offsetX: clamp(offsetX, -maxX, maxX), offsetY: clamp(offsetY, -maxY, maxY) };
+}
+
 type LibraryPhoto = {
   id: string;
   src: string;
@@ -164,6 +182,19 @@ export default function App() {
   );
   const [selectedCellId, setSelectedCellId] = useState<string | null>(null);
 
+  // Mobile off-canvas drawers (no-op on lg+ where the panels are static)
+  const [leftOpen, setLeftOpen] = useState(false);
+  const [rightOpen, setRightOpen] = useState(false);
+  // Selects a cell and opens its editor drawer. A plain `setSelectedCellId`
+  // plus a `useEffect` keyed on the id would miss re-taps of an
+  // already-selected cell (id doesn't change → effect doesn't re-run → the
+  // drawer, once closed, could never be reopened for that cell), so the
+  // open is done directly, every time a cell is picked.
+  const selectCell = useCallback((id: string) => {
+    setSelectedCellId(id);
+    setRightOpen(true);
+  }, []);
+
   // Keep cells count in sync with grid
   useEffect(() => {
     const total = grid.cols * grid.rows;
@@ -272,8 +303,8 @@ export default function App() {
           : c
       )
     );
-    setSelectedCellId(cellId);
-  }, []);
+    selectCell(cellId);
+  }, [selectCell]);
 
   const updateCellPhoto = useCallback((cellId: string, patch: Partial<CellPhoto>) => {
     setCells((prev) =>
@@ -488,6 +519,42 @@ export default function App() {
     [renderCollageToCanvas, exportScale, page.width, page.height]
   );
 
+  // Mouse drag-to-pan on the workspace background (outside the collage).
+  // Touch already pans natively via the scroll container; this covers mice,
+  // which have no equivalent for a plain overflow-auto div.
+  const canvasPanState = useRef<{
+    startX: number;
+    startY: number;
+    startScrollLeft: number;
+    startScrollTop: number;
+    moved: boolean;
+  } | null>(null);
+  const canvasPanMovedRef = useRef(false);
+
+  useEffect(() => {
+    const move = (e: MouseEvent) => {
+      const st = canvasPanState.current;
+      const el = workspaceRef.current;
+      if (!st || !el) return;
+      const dx = e.clientX - st.startX;
+      const dy = e.clientY - st.startY;
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) st.moved = true;
+      el.scrollLeft = st.startScrollLeft - dx;
+      el.scrollTop = st.startScrollTop - dy;
+    };
+    const up = () => {
+      if (canvasPanState.current) canvasPanMovedRef.current = canvasPanState.current.moved;
+      canvasPanState.current = null;
+      document.body.style.cursor = "";
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+    return () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+    };
+  }, []);
+
   // Drag photo transform state
   const dragState = useRef<{
     cellId: string;
@@ -497,21 +564,26 @@ export default function App() {
     origOffsetY: number;
   } | null>(null);
 
+  // While a photo is being actively panned/pinched, its transform transition
+  // is disabled (see the <img> style below) so it tracks the pointer 1:1;
+  // once released, the transition re-enables so any programmatic offset
+  // change (e.g. a reclamp) eases in instead of jumping.
+  const [panningCellId, setPanningCellId] = useState<string | null>(null);
+
   useEffect(() => {
     const move = (e: MouseEvent) => {
       const st = dragState.current;
       if (!st) return;
       const cell = cells.find((c) => c.id === st.cellId)?.photo;
-      if (!cell) return;
+      const dims = cellLayout.find((c) => c.id === st.cellId);
+      if (!cell || !dims) return;
       const dx = (e.clientX - st.startX) / displayScale;
       const dy = (e.clientY - st.startY) / displayScale;
-      updateCellPhoto(st.cellId, {
-        offsetX: st.origOffsetX + dx,
-        offsetY: st.origOffsetY + dy,
-      });
+      updateCellPhoto(st.cellId, clampCellOffset(cell, st.origOffsetX + dx, st.origOffsetY + dy, dims.w, dims.h));
     };
     const up = () => {
       dragState.current = null;
+      setPanningCellId(null);
       document.body.style.cursor = "";
     };
     window.addEventListener("mousemove", move);
@@ -520,7 +592,101 @@ export default function App() {
       window.removeEventListener("mousemove", move);
       window.removeEventListener("mouseup", up);
     };
-  }, [cells, displayScale, updateCellPhoto]);
+  }, [cells, cellLayout, displayScale, updateCellPhoto]);
+
+  // Pinch-to-zoom state (two-finger touch)
+  const pinchState = useRef<{
+    cellId: string;
+    startDist: number;
+    origScale: number;
+  } | null>(null);
+
+  // Touch pan (1 finger, reuses dragState) + pinch zoom (2 fingers).
+  // Registered as a native, non-passive listener so preventDefault() actually
+  // stops the page from scrolling while the user is repositioning a photo —
+  // React's onTouchMove prop is passive and can't do that. onTouchStart is
+  // passive by default too (React 17+), so a quick, perfectly still tap —
+  // no touchmove ever fires — never got a preventDefault() call anywhere,
+  // and the browser went on to replay it as a full synthetic mouse sequence
+  // (mousemove/mousedown/mouseup/click) a moment later, double-handling the
+  // same tap and causing the flash of glitchy state. A longer press usually
+  // has a hair of finger jitter, which fires one touchmove (which *does*
+  // preventDefault) and masked the bug. touchstart is handled natively here
+  // too — via delegation on `data-cell-id`, since the photo wrapper is
+  // re-created per cell on every render — so every tap is suppressed up
+  // front, unconditionally.
+  useEffect(() => {
+    const touchDist = (t0: Touch, t1: Touch) =>
+      Math.hypot(t0.clientX - t1.clientX, t0.clientY - t1.clientY);
+
+    const start = (e: TouchEvent) => {
+      const el = (e.target as HTMLElement | null)?.closest<HTMLElement>("[data-cell-id]");
+      const cellId = el?.dataset.cellId;
+      if (!cellId) return;
+      const cell = cells.find((c) => c.id === cellId)?.photo;
+      if (!cell) return;
+      e.preventDefault();
+      selectCell(cellId);
+      setPanningCellId(cellId);
+      if (e.touches.length === 2) {
+        dragState.current = null;
+        const [t0, t1] = [e.touches[0], e.touches[1]];
+        pinchState.current = { cellId, startDist: touchDist(t0, t1), origScale: cell.scale };
+      } else if (e.touches.length === 1) {
+        pinchState.current = null;
+        const t = e.touches[0];
+        dragState.current = {
+          cellId,
+          startX: t.clientX,
+          startY: t.clientY,
+          origOffsetX: cell.offsetX,
+          origOffsetY: cell.offsetY,
+        };
+      }
+    };
+
+    const move = (e: TouchEvent) => {
+      if (e.touches.length === 2 && pinchState.current) {
+        const st = pinchState.current;
+        const cell = cells.find((c) => c.id === st.cellId)?.photo;
+        const dims = cellLayout.find((c) => c.id === st.cellId);
+        if (!cell || !dims) return;
+        e.preventDefault();
+        const dist = touchDist(e.touches[0], e.touches[1]);
+        const nextScale = clamp((dist / st.startDist) * st.origScale, 0.4, 5);
+        updateCellPhoto(st.cellId, {
+          scale: nextScale,
+          ...clampCellOffset({ ...cell, scale: nextScale }, cell.offsetX, cell.offsetY, dims.w, dims.h),
+        });
+        return;
+      }
+      const st = dragState.current;
+      if (!st || e.touches.length !== 1) return;
+      const cell = cells.find((c) => c.id === st.cellId)?.photo;
+      const dims = cellLayout.find((c) => c.id === st.cellId);
+      if (!cell || !dims) return;
+      e.preventDefault();
+      const t = e.touches[0];
+      const dx = (t.clientX - st.startX) / displayScale;
+      const dy = (t.clientY - st.startY) / displayScale;
+      updateCellPhoto(st.cellId, clampCellOffset(cell, st.origOffsetX + dx, st.origOffsetY + dy, dims.w, dims.h));
+    };
+    const end = () => {
+      dragState.current = null;
+      pinchState.current = null;
+      setPanningCellId(null);
+    };
+    window.addEventListener("touchstart", start, { passive: false });
+    window.addEventListener("touchmove", move, { passive: false });
+    window.addEventListener("touchend", end);
+    window.addEventListener("touchcancel", end);
+    return () => {
+      window.removeEventListener("touchstart", start);
+      window.removeEventListener("touchmove", move);
+      window.removeEventListener("touchend", end);
+      window.removeEventListener("touchcancel", end);
+    };
+  }, [cells, cellLayout, displayScale, updateCellPhoto, selectCell]);
 
   // Crop modal
   const [cropModal, setCropModal] = useState<{
@@ -637,16 +803,33 @@ export default function App() {
 
   return (
     <div className="min-h-screen text-zinc-800 bg-[#f5f3f0]" style={{ fontFamily: "Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial" }}>
-      <div className="flex h-screen">
+      <div className="flex flex-col lg:flex-row h-screen relative overflow-hidden">
+        {/* Right panel is a bottom sheet on mobile, not a full overlay, so the
+            grid stays visible/interactive underneath it — no backdrop for it. */}
+        {leftOpen && (
+          <div
+            onClick={() => setLeftOpen(false)}
+            className="fixed inset-0 bg-black/40 z-30 lg:hidden"
+          />
+        )}
         {/* Left Sidebar */}
-        <aside className="w-[340px] shrink-0 border-r border-zinc-200 bg-white/80 backdrop-blur overflow-y-auto">
+        <aside
+          className={`fixed inset-y-0 left-0 z-40 w-[85vw] max-w-[340px] transform transition-transform duration-300 ${
+            leftOpen ? "translate-x-0" : "-translate-x-full"
+          } lg:translate-x-0 lg:static lg:z-auto lg:w-[340px] shrink-0 border-r border-zinc-200 bg-white lg:bg-white/80 backdrop-blur overflow-y-auto`}
+        >
           <div className="px-5 pt-5 pb-4 border-b border-zinc-200">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-xl bg-zinc-900 text-white grid place-items-center font-semibold">CL</div>
-              <div>
+              <div className="flex-1">
                 <div className="text-[17px] font-[700] tracking-tight">Flexy Collage Editor</div>
                 <div className="text-[12px] text-zinc-500 -mt-0.5">free tool best tool</div>
               </div>
+              <button
+                onClick={() => setLeftOpen(false)}
+                className="lg:hidden text-zinc-500 hover:text-zinc-800 w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100"
+                aria-label="Close settings"
+              >✕</button>
             </div>
           </div>
 
@@ -809,27 +992,65 @@ export default function App() {
         {/* Canvas */}
         <main className="flex-1 flex flex-col min-w-0 bg-[#ece8e3]">
           {/* Toolbar */}
-          <div className="h-[56px] border-b border-zinc-200 bg-white flex items-center px-4 gap-3">
-            <div className="text-sm text-zinc-600">
+          <div className="min-h-[56px] flex-wrap sm:flex-nowrap border-b border-zinc-200 bg-white flex items-center px-4 py-2 sm:py-0 gap-3">
+            <button
+              onClick={() => setLeftOpen(true)}
+              className="lg:hidden w-9 h-9 shrink-0 grid place-items-center rounded-lg border border-zinc-300 bg-white hover:bg-zinc-50"
+              aria-label="Open settings"
+            >☰</button>
+            <div className="text-sm text-zinc-600 truncate min-w-0">
               {page.width} × {page.height}px • {grid.cols}×{grid.rows}
             </div>
             <div className="flex-1" />
             <button
+              onClick={() => setRightOpen(true)}
+              className="lg:hidden w-9 h-9 shrink-0 grid place-items-center rounded-lg border border-zinc-300 bg-white hover:bg-zinc-50"
+              aria-label="Open library"
+            >🖼</button>
+            <button
               onClick={()=>fileInputRef.current?.click()}
-              className="px-3.5 py-2 rounded-full bg-zinc-900 text-white text-[13px] font-medium hover:bg-zinc-800"
+              className="px-3 sm:px-3.5 py-2 rounded-full bg-zinc-900 text-white text-[13px] font-medium hover:bg-zinc-800 whitespace-nowrap"
             >Add photos</button>
             <input ref={fileInputRef} type="file" className="hidden" accept="image/*,.heic,.heif" multiple onChange={e=>{ addFiles(e.target.files); e.currentTarget.value=''; }} />
-            <div className="text-xs text-zinc-500">Fit: {Math.round(fitScale*100)}%</div>
+            <div className="hidden lg:block text-xs text-zinc-500">Fit: {Math.round(fitScale*100)}%</div>
           </div>
 
-          <div ref={workspaceRef} className="flex-1 relative overflow-auto">
+          <div
+            ref={workspaceRef}
+            className={`flex-1 relative overflow-auto transition-[padding] duration-300 ${rightOpen ? "pb-[45vh] lg:pb-0" : "pb-0"}`}
+          >
             {/* Checker / dot bg */}
             <div className="absolute inset-0" style={{
               backgroundImage: "radial-gradient(rgba(0,0,0,.12) 1px, transparent 1px)",
               backgroundSize: "18px 18px",
               backgroundPosition: "0 0",
             }}/>
-            <div className="absolute inset-0 flex items-center justify-center">
+            {/* Normal-flow (not absolute), so it actually respects the
+                workspace's pb-[45vh] and centers the collage in the space
+                still visible above the bottom sheet, instead of the full
+                unpadded box. */}
+            <div
+              className="relative min-h-full flex items-center justify-center cursor-grab active:cursor-grabbing"
+              onMouseDown={(e) => {
+                if (e.target !== e.currentTarget || e.button !== 0) return;
+                const el = workspaceRef.current;
+                if (!el) return;
+                canvasPanState.current = {
+                  startX: e.clientX,
+                  startY: e.clientY,
+                  startScrollLeft: el.scrollLeft,
+                  startScrollTop: el.scrollTop,
+                  moved: false,
+                };
+                document.body.style.cursor = "grabbing";
+              }}
+              onClick={(e) => {
+                if (e.target !== e.currentTarget) return;
+                if (canvasPanMovedRef.current) { canvasPanMovedRef.current = false; return; }
+                setSelectedCellId(null);
+                setRightOpen(false);
+              }}
+            >
               <div
                 style={{
                   width: displayPageW,
@@ -851,7 +1072,7 @@ export default function App() {
                   return (
                     <div
                       key={cell.id}
-                      onClick={() => setSelectedCellId(cell.id)}
+                      onClick={() => selectCell(cell.id)}
                       onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; }}
                       onDrop={(e) => {
                         e.preventDefault();
@@ -875,10 +1096,12 @@ export default function App() {
                     >
                       {p ? (
                         <div
-                          className="w-full h-full relative"
+                          className="w-full h-full relative touch-none"
+                          data-cell-id={cell.id}
                           onMouseDown={(e) => {
                             if (e.button !== 0) return;
-                            setSelectedCellId(cell.id);
+                            selectCell(cell.id);
+                            setPanningCellId(cell.id);
                             dragState.current = {
                               cellId: cell.id,
                               startX: e.clientX,
@@ -892,8 +1115,11 @@ export default function App() {
                           onWheel={(e) => {
                             e.preventDefault();
                             const delta = -e.deltaY * 0.0018;
-                            const next = clamp(p.scale * (1 + delta), 0.4, 5);
-                            updateCellPhoto(cell.id, { scale: next });
+                            const nextScale = clamp(p.scale * (1 + delta), 0.4, 5);
+                            updateCellPhoto(cell.id, {
+                              scale: nextScale,
+                              ...clampCellOffset({ ...p, scale: nextScale }, p.offsetX, p.offsetY, cell.w, cell.h),
+                            });
                           }}
                         >
                           <img
@@ -908,6 +1134,7 @@ export default function App() {
                               height: p.naturalHeight,
                               transform: `translate(calc(-50% + ${p.offsetX * displayScale}px), calc(-50% + ${p.offsetY * displayScale}px)) scale(${ (Math.max(w / p.naturalWidth, h / p.naturalHeight) * p.scale )}) rotate(${p.rotation}deg) scaleX(${p.flipH ? -1 : 1}) scaleY(${p.flipV ? -1 : 1})`,
                               transformOrigin: "center",
+                              transition: panningCellId === cell.id ? "none" : "transform 150ms ease-out",
                               filter: cssFilterString(p.filters),
                               userSelect: "none",
                               pointerEvents: "none",
@@ -920,9 +1147,6 @@ export default function App() {
                           Drop photo
                         </div>
                       )}
-                      <div className="absolute top-1.5 left-1.5 text-[10px] bg-white/85 px-1.5 py-0.5 rounded-md text-zinc-600 shadow-sm">
-                        {cell.row+1}·{cell.col+1}
-                      </div>
                     </div>
                   );
                 })}
@@ -930,13 +1154,13 @@ export default function App() {
             </div>
           </div>
 
-          <div className="h-10 border-t border-zinc-200 bg-white px-4 text-[12px] text-zinc-600 flex items-center gap-4">
+          <div className="min-h-10 flex-wrap border-t border-zinc-200 bg-white px-4 py-1.5 sm:py-0 text-[12px] text-zinc-600 flex items-center gap-4">
             {selectedCell && selectedCell.photo ? (
               <>
                 <span>Cell { (selectedCellLayout?.row ?? 0)+1 } / { (selectedCellLayout?.col ?? 0)+1 }</span>
                 <span>•</span>
                 <span>Zoom {Math.round(selectedCell.photo.scale*100)}%</span>
-                <span>• Drag to pan • Scroll to zoom</span>
+                <span className="hidden sm:inline">• Drag to pan • Scroll to zoom</span>
               </>
             ) : (
               <span>Click a cell to edit. Drag photos from the right library onto cells.</span>
@@ -944,9 +1168,23 @@ export default function App() {
           </div>
         </main>
 
-        {/* Right Sidebar */}
-        <aside className="w-[375px] shrink-0 border-l border-zinc-200 bg-white overflow-y-auto">
-          <div className="p-5">
+        {/* Right panel: a bottom sheet on mobile (grid stays visible above
+            it — see the workspace's matching pb-[45vh] — instead of a full
+            overlay), the regular static sidebar at lg: and up. */}
+        <aside
+          className={`fixed inset-x-0 bottom-0 h-[45vh] z-40 transform transition-transform duration-300 ${
+            rightOpen ? "translate-y-0" : "translate-y-full"
+          } lg:translate-y-0 lg:static lg:inset-auto lg:z-auto lg:h-auto lg:w-[375px] shrink-0 border-t lg:border-t-0 lg:border-l border-zinc-200 bg-white rounded-t-2xl lg:rounded-none shadow-[0_-8px_30px_rgba(0,0,0,.15)] lg:shadow-none overflow-y-auto`}
+        >
+          <div className="w-10 h-1 rounded-full bg-zinc-300 mx-auto mt-2.5 lg:hidden" />
+          <div className="flex justify-end px-5 pt-2 lg:pt-4 lg:hidden">
+            <button
+              onClick={() => setRightOpen(false)}
+              className="text-zinc-500 hover:text-zinc-800 w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100"
+              aria-label="Close library"
+            >✕</button>
+          </div>
+          <div className="p-5 pt-0 lg:pt-5">
             {selectedCell ? (
               <div className="space-y-6">
                 <div className="flex items-center justify-between">
@@ -1006,7 +1244,17 @@ export default function App() {
                           <input
                             type="range" min={0.4} max={4} step={0.01}
                             value={selectedCell.photo.scale}
-                            onChange={(e)=>updateCellPhoto(selectedCell.id, { scale: parseFloat(e.target.value) })}
+                            onChange={(e)=>{
+                              const nextScale = parseFloat(e.target.value);
+                              const photo = selectedCell.photo!;
+                              const dims = selectedCellLayout;
+                              updateCellPhoto(selectedCell.id, {
+                                scale: nextScale,
+                                ...(dims
+                                  ? clampCellOffset({ ...photo, scale: nextScale }, photo.offsetX, photo.offsetY, dims.w, dims.h)
+                                  : {}),
+                              });
+                            }}
                             className="w-full accent-zinc-900 mt-1"
                           />
                         </label>
@@ -1124,15 +1372,15 @@ export default function App() {
 
       {/* Crop Modal */}
       {cropModal.open && selectedCell?.photo && (
-        <div className="fixed inset-0 bg-black/70 z-50 grid place-items-center p-6">
-          <div className="w-full max-w-5xl bg-white rounded-[22px] shadow-2xl overflow-hidden">
+        <div className="fixed inset-0 bg-black/70 z-50 grid place-items-center p-3 sm:p-6">
+          <div className="w-full max-w-5xl max-h-[92vh] bg-white rounded-[22px] shadow-2xl overflow-y-auto">
             <div className="px-5 py-4 border-b border-zinc-200 flex items-center justify-between">
               <div className="font-semibold">Crop Image</div>
               <button onClick={()=> setCropModal({open:false, cellId:null, src:"", width:1, height:1})}
                 className="px-3 py-1.5 rounded-lg bg-zinc-100 hover:bg-zinc-200 text-sm">Close</button>
             </div>
             <div className="grid md:grid-cols-[1fr_300px] gap-0">
-              <div className="relative h-[520px] bg-zinc-950">
+              <div className="relative h-[45vh] sm:h-[520px] bg-zinc-950">
                 <Cropper
                   image={cropModal.src}
                   crop={crop}
@@ -1234,9 +1482,9 @@ function LibraryGrid({ library, selectedCellId, onPick, onDelete }: {
             draggable
             onDragStart={(e)=> e.dataTransfer.setData("text/photo-id", p.id)}
             onClick={()=> onPick(p)}
-            className="w-full aspect-square object-cover cursor-pointer"
+            className="w-full aspect-square object-cover cursor-pointer active:opacity-70 active:scale-[0.98] transition"
           />
-          <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/60 to-transparent px-2.5 py-2 text-[11px] text-white flex items-center justify-between opacity-0 group-hover:opacity-100 transition">
+          <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/60 to-transparent px-2.5 py-2 text-[11px] text-white flex items-center justify-between opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition">
             <span className="truncate">{p.width}×{p.height}</span>
             <button
               onClick={(e)=>{ e.stopPropagation(); onDelete(p.id); }}

@@ -1,67 +1,53 @@
-# Fix: HEIC photos fail to upload
+# Make the app mobile-friendly
 
-## Root cause
-`heic2any@0.0.4` (last published 2020) bundles an old libheif. Modern iOS HDR HEICs —
-ftyp brands `heic mif1 MiHB MiHE MiPr miaf tmap`, i.e. a `tmap` tone-map primary item —
-throw `ERR_LIBHEIF format not supported`. Reproduced in-browser against `IMG_4882.HEIC`.
-
-Secondary: `addFiles` uses `Promise.all`, so one failing file rejects the whole batch
-and silently drops every photo the user selected.
+Full plan: `/home/sun50/.claude/plans/quiet-beaming-otter.md`
 
 ## Tasks
-- [x] Reproduce and confirm root cause in a real browser
-- [x] Verify `heic-to` (libheif-js 1.19.x) decodes the same file
-- [x] Add `libheif-js`, remove `heic2any`
-- [x] Move conversion into an inlined Web Worker (keeps `vite-plugin-singlefile` build intact)
-- [x] `addFiles`: per-file failure tolerance + converting indicator
-- [x] Verify in browser: HEIC upload succeeds, UI stays responsive
-- [x] Verify production single-file build still works
+- [x] Drawer state + auto-open right drawer on cell select (`App.tsx`)
+- [x] Root container → `flex flex-col lg:flex-row`, backdrop overlay
+- [x] Left `<aside>` → off-canvas drawer (`lg:` reverts to static)
+- [x] Right `<aside>` → off-canvas drawer (`lg:` reverts to static)
+- [x] Toolbar: wrap on mobile, add drawer-toggle buttons, hide "Fit: %" below `lg`
+- [x] Status bar: allow wrapping on mobile
+- [x] Touch pan (single-finger) on cell photo, non-passive `touchmove`/`touchend` listeners
+- [x] Touch pinch-to-zoom (two-finger) on cell photo
+- [x] Crop modal: fit small viewports (`max-h`, responsive Cropper height)
+- [x] `index.css`: `touch-action: manipulation` on interactive elements
+- [ ] Verify mobile viewport via chrome-devtools — **not possible**, no Chrome/Chromium binary in this WSL sandbox (`mcp__chrome-devtools__new_page` failed: "Could not connect to Chrome"; `which chromium/google-chrome` empty). Not attempted a Playwright browser install since that's an invasive download the user didn't ask for.
+- [x] `npx tsc --noEmit` clean
+- [x] `npm run build` passes (single-file `dist/index.html`, 2.52 MB)
 
 ## Review
 
-**Changes**
-- `src/utils/heicWorker.ts` (new) — decodes with `libheif-js` (libheif 1.19.x) and encodes
-  via `OffscreenCanvas.convertToBlob`. Wrapper libs (`heic2any`, `heic-to`) all encode through
-  `document.createElement("canvas")`, so none of them can run in a worker; using libheif-js
-  directly avoids that. `libheif-js/wasm-bundle` inlines the .wasm as base64.
-- `src/utils/heic.ts` (new) — single lazily-created worker, id-keyed request map,
-  `onerror` rejects everything in flight and drops the worker so the next call gets a fresh one.
-  Owns `isHeicFile`, moved out of `App.tsx`.
-- `src/App.tsx` — `loadImageFile` calls `heicToJpeg`; `addFiles` uses `Promise.allSettled`
-  with an `ImportStatus` spinner/error strip; object URL is revoked on decode failure.
-- `vite.config.ts` — `worker.format: "es"` (the default `iife` silently produced a worker
-  containing ESM `import`, which failed with an opaque error), and
-  `optimizeDeps.include` for `libheif-js/wasm-bundle` since Vite's dev scanner
-  doesn't follow into workers.
+**Changes** (`src/App.tsx`, `src/index.css`)
+- Root layout: `flex h-screen` → `flex flex-col lg:flex-row h-screen relative overflow-hidden`. On `<lg` the two `<aside>` panels are `fixed` (out of flow) so `<main>` naturally becomes full-width/height; at `lg:` they go back to `static` — the original 3-column desktop layout is untouched via `lg:` overrides throughout.
+- Left/right sidebars are now off-canvas drawers on mobile: `w-[85vw] max-w-[…px]`, slide via `translate-x` + `transition-transform`, `leftOpen`/`rightOpen` state, a click-catching backdrop, and an `✕` close button in each (`lg:hidden`). Selecting a cell (`selectedCellId` changes) auto-opens the right drawer so the Cell Editor is immediately visible on mobile.
+- Toolbar (`App.tsx:887`) and status bar (`App.tsx:1040`) allow wrapping (`flex-wrap`) and variable height on mobile instead of a fixed pixel height; added ☰ (open settings drawer) and 🖼 (open library/editor drawer) icon buttons, both `lg:hidden`; "Fit: %" indicator hidden below `lg`.
+- Touch support for the core cell-photo gesture, which previously had **zero** touch handling (mouse-only `onMouseDown`/window `mousemove`/`mouseup`, and `onWheel`): added `onTouchStart` on the photo wrapper plus a new `useEffect` with native (non-passive) `window` listeners for `touchmove`/`touchend`/`touchcancel`, mirroring the existing mouse-drag effect. One finger pans (reuses the existing `dragState` ref/shape); two fingers pinch-zoom (`pinchState` ref, distance ratio, same 0.4–5 clamp as wheel-zoom). Listeners are native/non-passive so `preventDefault()` reliably stops the page from scrolling mid-gesture — React's `onTouchMove` prop can't do that reliably.
+- Crop modal: outer card gets `max-h-[92vh] overflow-y-auto`, backdrop padding shrinks on mobile (`p-3 sm:p-6`), and the Cropper's fixed `h-[520px]` becomes `h-[45vh] sm:h-[520px]` so it fits short phone viewports instead of overflowing.
+- `index.css`: added `touch-action: manipulation` on buttons/links/range inputs to remove the mobile tap delay and stray double-tap-zoom.
 
-**Verified in Chrome against the real iOS 18 HDR file (`IMG_4882.HEIC`, 5712×4284)**
-- Dev server, via the actual "Add photos" button: imports, lands in the library, auto-fills
-  cell 1·1. ~6.5 s conversion.
-- Main thread stays responsive during conversion: p95 frame 18 ms (one 294 ms spike when the
-  4.9 MB JPEG paints). Previously this was a full main-thread block.
-- Truncated file → `Couldn't read broken.heic — libheif could not decode this image`,
-  app keeps working, and a good file imported right afterwards on the same worker (~3.3 s warm).
-- `npm run build` still emits a single `dist/index.html` (2.5 MB) — the worker is inlined —
-  and both paths above were re-verified against that built file.
-- `npx tsc --noEmit` clean.
+**Verified**
+- `npx tsc --noEmit` — clean.
+- `npm run build` — succeeds, still emits a single self-contained `dist/index.html`.
+- Manual diff review for structural correctness (balanced JSX, `lg:` overrides present on every mobile-only class, shared refs/state wired consistently between the new touch effect and the existing mouse effect).
 
-**Follow-up: `IMG_6142.HEIC` — "no image found in file"**
+**Not verified (couldn't be, in this environment)**
+- No visual/interactive check in an actual mobile viewport — this sandbox has no Chrome/Chromium binary, so the `chrome-devtools` MCP tools couldn't attach (`new_page` → "Could not connect to Chrome"), and none of `google-chrome`/`chromium`/`chromium-browser` are installed. Didn't install Playwright's browser (large download) unasked.
+- Dev server is running at `http://localhost:5173/` — please check on an actual phone or with your browser's device toolbar (resize below ~1024px width to see the drawer behavior; try a cell with a photo to test one-finger pan / two-finger pinch on a touchscreen).
 
-That file is a baseline JPEG (836×627, iPhone 16e, iOS 18.6.2) that merely carries a `.HEIC`
-extension — Apple's export/share flows do this regularly. The code trusted the extension and
-fed a JPEG to libheif, which correctly reported no HEIF image.
+**Follow-ups worth knowing about**
+- Touch targets in the Transform/Adjust panels (rotation, flip, filter reset buttons) weren't resized — they're ~30–36px, a bit under the 44px touch-target guideline, but functional. Left alone to keep the diff minimal per the approved plan.
+- HTML5 drag-and-drop (library photo → cell) is still desktop-only; mobile already has a working fallback (tap a library thumbnail to assign it to the selected/first-empty cell), so this wasn't touched.
 
-Fix: `needsHeicDecode()` in `src/utils/heic.ts` sniffs the `ftyp` box and major brand
-(`heic/heix/heim/heis/hevc/hevx/hevm/hevs/mif1/msf1`) instead of trusting the filename.
-AVIF is deliberately excluded — browsers decode it natively and faster. `isHeicFile` is now
-only the accept-filter (`.heic` often arrives with an empty MIME type), and `loadImageFile`
-decides by content. This also covers the reverse case: a genuine HEIC named `.jpg`.
+## Round 2 — user-reported issues after trying it on a real phone
 
-Verified in Chrome: the mislabeled JPEG imports instantly at 627×836 (EXIF rotation applied),
-a genuine HEIC still routes through the worker, and both sit in the library together.
+1. **No visible feedback on tap.** Root cause: Tailwind v4 wraps every `hover:` utility in `@media (hover: hover)` (confirmed by grepping the built CSS — `@media(hover:hover){...}`), so on a touchscreen (`hover: none`) none of the `hover:` classes ever apply — not a "missing feature", the hover states were never reachable on mobile at all. Worse, `group-hover:opacity-100` on the library thumbnail overlay (delete ✕ button + dimensions) meant that overlay was **permanently invisible and untappable on mobile** — a real functional bug, not just a missing-affordance issue.
+2. **Dragging a photo scrolls the whole page instead of repositioning it.** Root cause: the photo wrapper div had touch listeners, but no `touch-action: none`. Without that CSS property, mobile browsers can start native scrolling on the nearest scrollable ancestor before/alongside the JS `preventDefault()` call in the touchmove listener — the two were racing.
 
-**Notes / possible follow-ups**
-- Bundle grew ~1.5 MB from the inlined libheif wasm. If that matters for the single-file
-  distribution, the worker could be split out and loaded on demand.
-- Conversions are serialized through one worker. Fine for a handful of photos; a pool would
-  help for large batches.
+**Fixes**
+- `src/index.css`: `html { -webkit-tap-highlight-color: transparent }` + a global `button:not(:disabled):active { transform: scale(.96); opacity: .85; transition: ... }` — every button now gets a consistent, immediate press state on tap, with no per-button JSX edits needed. Verified compiled into `dist/index.html`.
+- `src/App.tsx` (`LibraryGrid`): the thumbnail overlay is now `opacity-100 sm:opacity-0 sm:group-hover:opacity-100` — always visible (delete button reachable) below the `sm` breakpoint, hover-reveal preserved on desktop. Added `active:opacity-70 active:scale-[0.98]` on the thumbnail `<img>` itself (not a `<button>`, so outside the global CSS rule).
+- `src/App.tsx`: added `touch-none` (`touch-action: none`) to the cell's photo-wrapper div (the one with `onTouchStart`/`onMouseDown`/`onWheel`), so the browser never hands the gesture to native scrolling in the first place — our JS pan/pinch handlers own it exclusively. Verified compiled into `dist/index.html` as `touch-action:none`.
+
+**Verified:** `npx tsc --noEmit` clean, `npm run build` succeeds, grepped the built CSS to confirm `touch-action:none`, the `:active` rule, and `-webkit-tap-highlight-color:transparent` all made it into the bundle. Still no real browser in this sandbox to click-test interactively — please re-check on your phone.
