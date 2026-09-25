@@ -644,8 +644,8 @@ export default function App() {
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-xl bg-zinc-900 text-white grid place-items-center font-semibold">CL</div>
               <div>
-                <div className="text-[17px] font-[700] tracking-tight">CollageLab</div>
-                <div className="text-[12px] text-zinc-500 -mt-0.5">Pixel-perfect collage editor</div>
+                <div className="text-[17px] font-[700] tracking-tight">Flexy Collage Editor</div>
+                <div className="text-[12px] text-zinc-500 -mt-0.5">free tool best tool</div>
               </div>
             </div>
           </div>
