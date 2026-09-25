@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 // @ts-ignore
 import Cropper from "react-easy-crop";
 import { jsPDF } from "jspdf";
+import { heicToJpeg, isHeicFile, needsHeicDecode } from "./utils/heic";
 
 // Helpers
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -86,21 +87,25 @@ function canvasFilterString(f: CellFilters) {
   return `brightness(${f.brightness}%) contrast(${f.contrast}%) saturate(${f.saturate}%) grayscale(${f.grayscale}%) blur(${f.blur}px) hue-rotate(${f.hue}deg)`;
 }
 
-// Load image size
-function loadImageFile(file: File): Promise<LibraryPhoto> {
+// Load image file, converting HEIC/HEIF to JPEG first
+async function loadImageFile(file: File): Promise<LibraryPhoto> {
+  let blob: Blob = file;
+  let name = file.name;
+
+  if (await needsHeicDecode(file)) {
+    blob = await heicToJpeg(file);
+    name = name.replace(/\.(heic|heif)$/i, ".jpg");
+  }
+
   return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
+    const url = URL.createObjectURL(blob);
     const img = new Image();
-    img.onload = () => {
-      resolve({
-        id: uid(),
-        src: url,
-        name: file.name,
-        width: img.naturalWidth,
-        height: img.naturalHeight,
-      });
+    img.onload = () =>
+      resolve({ id: uid(), src: url, name, width: img.naturalWidth, height: img.naturalHeight });
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error(`Could not decode ${file.name}`));
     };
-    img.onerror = reject;
     img.src = url;
   });
 }
@@ -185,13 +190,34 @@ export default function App() {
 
   // Photo upload
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [importing, setImporting] = useState(0);
+  const [importError, setImportError] = useState<string | null>(null);
   const addFiles = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return;
-    const loaded = await Promise.all(
-      Array.from(files)
-        .filter((f) => f.type.startsWith("image/"))
-        .map(loadImageFile)
+    const accepted = Array.from(files).filter(
+      (f) => f.type.startsWith("image/") || isHeicFile(f)
     );
+    if (accepted.length === 0) return;
+
+    setImportError(null);
+    setImporting((n) => n + accepted.length);
+    // One slow file must not take the rest of the batch down with it.
+    const results = await Promise.allSettled(
+      accepted.map((f) => loadImageFile(f).finally(() => setImporting((n) => n - 1)))
+    );
+    const loaded = results
+      .filter((r): r is PromiseFulfilledResult<LibraryPhoto> => r.status === "fulfilled")
+      .map((r) => r.value);
+    const failed = accepted
+      .map((f, i) => ({ f, r: results[i] }))
+      .filter((x): x is { f: File; r: PromiseRejectedResult } => x.r.status === "rejected");
+    if (failed.length > 0) {
+      setImportError(
+        failed.map(({ f, r }) => `Couldn't read ${f.name} — ${r.reason?.message ?? r.reason}`).join("; ")
+      );
+    }
+    if (loaded.length === 0) return;
+
     setLibrary((l) => [...loaded, ...l]);
     // Auto fill empty cells
     setCells((prev) => {
@@ -792,7 +818,7 @@ export default function App() {
               onClick={()=>fileInputRef.current?.click()}
               className="px-3.5 py-2 rounded-full bg-zinc-900 text-white text-[13px] font-medium hover:bg-zinc-800"
             >Add photos</button>
-            <input ref={fileInputRef} type="file" className="hidden" accept="image/*" multiple onChange={e=>{ addFiles(e.target.files); e.currentTarget.value=''; }} />
+            <input ref={fileInputRef} type="file" className="hidden" accept="image/*,.heic,.heif" multiple onChange={e=>{ addFiles(e.target.files); e.currentTarget.value=''; }} />
             <div className="text-xs text-zinc-500">Fit: {Math.round(fitScale*100)}%</div>
           </div>
 
@@ -953,7 +979,7 @@ export default function App() {
                         <input
                           ref={replaceInputRef}
                           type="file"
-                          accept="image/*"
+                          accept="image/*,.heic,.heif"
                           className="hidden"
                           onChange={async (e)=>{
                             const f = e.target.files?.[0];
@@ -1057,6 +1083,7 @@ export default function App() {
 
                 <div className="pt-2 border-t border-zinc-200">
                   <div className="text-[11.5px] font-semibold uppercase tracking-wider text-zinc-500 mb-3">Photo Library</div>
+                  <ImportStatus importing={importing} error={importError} />
                   <LibraryGrid
                     library={library}
                     selectedCellId={selectedCell.id}
@@ -1075,6 +1102,7 @@ export default function App() {
                   <div className="text-[13px] text-zinc-600">Upload images and click a cell to place them.</div>
                 </div>
                 <UploadDrop onFiles={addFiles} />
+                <ImportStatus importing={importing} error={importError} />
                 <LibraryGrid
                   library={library}
                   selectedCellId={null}
@@ -1160,8 +1188,25 @@ function UploadDrop({ onFiles }: { onFiles: (files: FileList | null) => void }) 
       className={`rounded-[16px] border-2 border-dashed px-4 py-7 text-center cursor-pointer transition ${over ? "border-zinc-900 bg-zinc-50" : "border-zinc-300 bg-zinc-50/60 hover:bg-zinc-50"}`}
     >
       <div className="text-sm font-medium">Drop images here</div>
-      <div className="text-[12px] text-zinc-500 mt-1">or click to browse — JPG, PNG, WebP</div>
-      <input ref={inputRef} type="file" accept="image/*" multiple className="hidden" onChange={e=>{ onFiles(e.target.files); e.currentTarget.value=''; }} />
+      <div className="text-[12px] text-zinc-500 mt-1">or click to browse — JPG, PNG, WebP, HEIC</div>
+      <input ref={inputRef} type="file" accept="image/*,.heic,.heif" multiple className="hidden" onChange={e=>{ onFiles(e.target.files); e.currentTarget.value=''; }} />
+    </div>
+  );
+}
+
+function ImportStatus({ importing, error }: { importing: number; error: string | null }) {
+  if (!importing && !error) return null;
+  return (
+    <div className="space-y-2 mb-3">
+      {importing > 0 && (
+        <div className="flex items-center gap-2 rounded-[12px] bg-zinc-100 px-3 py-2 text-[12px] text-zinc-600">
+          <span className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-zinc-400 border-t-transparent" />
+          Importing {importing} photo{importing > 1 ? "s" : ""}… HEIC files take a few seconds.
+        </div>
+      )}
+      {error && (
+        <div className="rounded-[12px] bg-red-50 px-3 py-2 text-[12px] text-red-700">{error}</div>
+      )}
     </div>
   );
 }
