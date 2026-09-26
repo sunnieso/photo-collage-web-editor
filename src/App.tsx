@@ -384,6 +384,20 @@ export default function App() {
   // Export
   const [isExporting, setIsExporting] = useState(false);
   const [exportScale, setExportScale] = useState(1);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  // Whether the browser can hand a file to the OS share sheet (iOS/Android
+  // "Save Image" goes to Photos, not Files) — mainly mobile Safari 16.4+ and
+  // Android Chrome. Falls back to the plain download otherwise.
+  const [canShareFiles, setCanShareFiles] = useState(false);
+  useEffect(() => {
+    try {
+      const probe = new File([""], "probe.png", { type: "image/png" });
+      setCanShareFiles(typeof navigator.share === "function" && !!navigator.canShare?.({ files: [probe] }));
+    } catch {
+      setCanShareFiles(false);
+    }
+  }, []);
 
   const renderCollageToCanvas = useCallback(
     async (outScale = 1, mime: "image/png" | "image/jpeg" = "image/png", quality = 0.92) => {
@@ -511,6 +525,36 @@ export default function App() {
           a.href = dataUrl;
           a.download = `collage-${page.width}x${page.height}.${type === "jpeg" ? "jpg" : "png"}`;
           a.click();
+        }
+      } finally {
+        setIsExporting(false);
+      }
+    },
+    [renderCollageToCanvas, exportScale, page.width, page.height]
+  );
+
+  // Hands the export off to the OS share sheet instead of the browser's
+  // download → the user picks "Save Image"/"Save to Photos" there, landing
+  // it in their photo library instead of the Files/Downloads folder.
+  const saveAsPhoto = useCallback(
+    async (type: "png" | "jpeg") => {
+      setIsExporting(true);
+      setExportError(null);
+      try {
+        const mime = type === "png" ? "image/png" : "image/jpeg";
+        const { canvas } = await renderCollageToCanvas(exportScale, mime, 0.93);
+        const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, mime, 0.93));
+        if (!blob) throw new Error("Could not render the image");
+        const file = new File(
+          [blob],
+          `collage-${page.width}x${page.height}.${type === "jpeg" ? "jpg" : "png"}`,
+          { type: mime }
+        );
+        await navigator.share({ files: [file] });
+      } catch (err) {
+        // AbortError just means the user dismissed the share sheet.
+        if ((err as Error)?.name !== "AbortError") {
+          setExportError(`Couldn't open the share sheet — ${(err as Error)?.message ?? err}`);
         }
       } finally {
         setIsExporting(false);
@@ -962,6 +1006,18 @@ export default function App() {
                     className="rounded-xl bg-zinc-900 text-white text-[13px] font-medium py-2.5 hover:bg-zinc-800 disabled:opacity-60"
                   >PDF</button>
                 </div>
+                {canShareFiles && (
+                  <button
+                    disabled={isExporting}
+                    onClick={() => saveAsPhoto("png")}
+                    className="lg:hidden w-full flex items-center justify-center gap-1.5 rounded-xl border border-zinc-300 bg-white text-zinc-800 text-[13px] font-medium py-2.5 hover:bg-zinc-50 disabled:opacity-60"
+                  >
+                    <span aria-hidden>📤</span> Save as Photo…
+                  </button>
+                )}
+                {exportError && (
+                  <div className="rounded-[12px] bg-red-50 px-3 py-2 text-[12px] text-red-700">{exportError}</div>
+                )}
                 <label className="block text-xs text-zinc-600">
                   Export resolution scale
                   <div className="flex items-center gap-3 mt-1">
@@ -979,6 +1035,9 @@ export default function App() {
                 </label>
                 <div className="text-[11px] text-zinc-500">
                   Exports at full pixel fidelity. PDF matches page size.
+                  {canShareFiles && (
+                    <span className="lg:hidden"> "Save as Photo" opens your share sheet — choose Save Image to add it straight to your photo library instead of Files.</span>
+                  )}
                 </div>
               </div>
             </section>
